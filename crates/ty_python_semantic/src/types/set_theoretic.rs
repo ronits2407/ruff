@@ -1,5 +1,4 @@
 use itertools::Either;
-
 use std::convert::Infallible;
 
 use crate::place::{
@@ -106,6 +105,61 @@ impl<'db> UnionType<'db> {
     pub(crate) fn expand_aliases(self, db: &'db dyn Db) -> Type<'db> {
         // Rebuild the union so that `UnionBuilder` simplifies any redundancies exposed.
         Self::from_elements(db, self.elements(db).iter().copied())
+    }
+
+    /// Expands top-level alias elements without relation-based simplification.
+    ///
+    /// The relation recursion guard calls this when a growing alias appears directly in a union. If
+    /// expansion reaches the same alias identity again, the alias is left in place.
+    pub(crate) fn expand_aliases_for_recursion_guard(self, db: &'db dyn Db) -> Type<'db> {
+        let mut builder = UnionBuilder::new(db).cycle_recovery(true);
+        let mut seen_aliases = Vec::new();
+        self.add_expanded_alias_elements(db, &mut builder, &mut seen_aliases);
+        builder.build()
+    }
+
+    fn add_expanded_alias_elements(
+        self,
+        db: &'db dyn Db,
+        builder: &mut UnionBuilder<'db>,
+        seen_aliases: &mut Vec<Type<'db>>,
+    ) {
+        for element in self.elements(db) {
+            Self::add_expanded_alias_element(db, builder, *element, seen_aliases);
+        }
+    }
+
+    fn add_expanded_alias_element(
+        db: &'db dyn Db,
+        builder: &mut UnionBuilder<'db>,
+        ty: Type<'db>,
+        seen_aliases: &mut Vec<Type<'db>>,
+    ) {
+        let Type::TypeAlias(alias) = ty else {
+            builder.add_in_place(ty);
+            return;
+        };
+
+        let Some(identity) = ty.recursive_identity(db) else {
+            builder.add_in_place(ty);
+            return;
+        };
+
+        if seen_aliases
+            .iter()
+            .any(|seen| seen.recursive_identity(db) == Some(identity))
+        {
+            builder.add_in_place(ty);
+            return;
+        }
+
+        seen_aliases.push(ty);
+        match alias.value_type(db) {
+            Type::Union(union) => {
+                union.add_expanded_alias_elements(db, builder, seen_aliases);
+            }
+            value_type => builder.add_in_place(value_type),
+        }
     }
 
     pub(crate) fn from_elements_cycle_recovery<I, T>(db: &'db dyn Db, elements: I) -> Type<'db>

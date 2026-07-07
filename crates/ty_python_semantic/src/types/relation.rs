@@ -15,13 +15,11 @@ use crate::types::enums::is_single_member_enum;
 use crate::types::function::FunctionDecorators;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::signatures::{ParametersKind, SignatureRelationVisitor};
-use crate::types::variance::VarianceInferable;
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ClassType, CycleDetector,
     IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
-    MaterializationKind, MemberLookupPolicy, PropertyInstanceType, ProtocolInstanceType,
-    SubclassOfInner, SubclassOfType, TypeAliasType, TypeVarBoundOrConstraints, TypeVarVariance,
-    UnionType, UpcastPolicy,
+    MemberLookupPolicy, PropertyInstanceType, ProtocolInstanceType, SubclassOfInner,
+    SubclassOfType, TypeAliasType, TypeVarBoundOrConstraints, UnionType, UpcastPolicy,
 };
 use crate::{
     Db,
@@ -782,13 +780,6 @@ pub(super) struct TypeRelationChecker<'a, 'c, 'db> {
     pub(super) materialization_visitor: &'a ApplyTypeMappingVisitor<'db>,
 }
 
-#[derive(Clone, Copy)]
-struct RecursiveAliasArgument<'db> {
-    variance: TypeVarVariance,
-    materialization_kind: Option<MaterializationKind>,
-    ty: Type<'db>,
-}
-
 #[derive(Clone, Debug, Eq)]
 enum RecursiveAliasSchemaType<'db> {
     SourceAlias(Box<[Self]>),
@@ -905,41 +896,6 @@ impl<'db> RecursiveAliasSchemaType<'db> {
             element => elements.push(element),
         }
     }
-
-    fn alias_arguments_for(&self, kind: RecursiveAliasSchemaKind) -> Option<&[Self]> {
-        match (self, kind) {
-            (Self::SourceAlias(arguments), RecursiveAliasSchemaKind::Source)
-            | (Self::TargetAlias(arguments), RecursiveAliasSchemaKind::Target) => Some(arguments),
-            _ => None,
-        }
-    }
-
-    fn children(&self) -> Option<&[Self]> {
-        match self {
-            Self::SourceAlias(arguments)
-            | Self::TargetAlias(arguments)
-            | Self::Union(arguments) => Some(arguments),
-            Self::Concrete(_) => None,
-        }
-    }
-
-    fn contains_alias_arguments_matching(
-        &self,
-        kind: RecursiveAliasSchemaKind,
-        predicate: &impl Fn(&[Self]) -> bool,
-    ) -> bool {
-        if let Some(arguments) = self.alias_arguments_for(kind)
-            && predicate(arguments)
-        {
-            return true;
-        }
-
-        self.children().is_some_and(|children| {
-            children
-                .iter()
-                .any(|child| child.contains_alias_arguments_matching(kind, predicate))
-        })
-    }
 }
 
 struct RecursiveAliasPairSchema<'db> {
@@ -1041,12 +997,20 @@ impl<'schema, 'db> RecursiveAliasSchemaMatcher<'schema, 'db> {
 
         match (left, right) {
             (SourceAlias(left), SourceAlias(right)) => {
-                self.arguments_match_same_schema(left, right, RecursiveAliasSchemaKind::Source)
-                    || self.slices_are_equivalent(left, right)
+                self.slices_are_equivalent(left, right)
+                    || self.arguments_match_same_schema(
+                        left,
+                        right,
+                        RecursiveAliasSchemaKind::Source,
+                    )
             }
             (TargetAlias(left), TargetAlias(right)) => {
-                self.arguments_match_same_schema(left, right, RecursiveAliasSchemaKind::Target)
-                    || self.slices_are_equivalent(left, right)
+                self.slices_are_equivalent(left, right)
+                    || self.arguments_match_same_schema(
+                        left,
+                        right,
+                        RecursiveAliasSchemaKind::Target,
+                    )
             }
             (Concrete(left), Concrete(right)) => left == right,
             (Union(left), Union(right)) => {
@@ -1116,12 +1080,6 @@ impl<'schema, 'db> RecursiveAliasSchemaMatcher<'schema, 'db> {
         };
 
         predicate(active_arguments)
-            || self
-                .active
-                .source
-                .iter()
-                .chain(self.active.target.iter())
-                .any(|argument| argument.contains_alias_arguments_matching(kind, &predicate))
     }
 
     fn arguments_grow_from_schema(
@@ -1403,11 +1361,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             ) {
                 return self.always();
             }
-            return self.check_recursive_type_alias_specialization_pair(
-                db,
-                source_alias,
-                target_alias,
-            );
+            return self.never();
         }
 
         self.always()
@@ -1420,9 +1374,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         current_source: TypeAliasType<'db>,
         current_target: TypeAliasType<'db>,
     ) -> bool {
-        // Growing aliases can revisit the same alias pair with larger arguments such as
-        // `U | A[T, U]`. For schema matching, the recursive alias part is the guarded recursive
-        // obligation, so compare the finite argument skeleton around it.
         if active_source.definition(db) != current_source.definition(db)
             || active_target.definition(db) != current_target.definition(db)
         {
@@ -1467,6 +1418,11 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             active_target,
         );
 
+        // Growing aliases can revisit the same alias pair with larger arguments such as
+        // `U | A[T, U]`. The guarded recursive obligation closes only if the current arguments are
+        // an instance of the active finite schema. Everything else is outside this finite fragment,
+        // so the caller conservatively rejects it instead of generating another recursive
+        // obligation.
         RecursiveAliasSchemaMatcher::new(&active_schema).matches(&current_schema)
     }
 
@@ -1479,134 +1435,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 .generic_context(db)
                 .map(|generic_context| generic_context.default_specialization(db, None))
         })
-    }
-
-    fn check_recursive_type_alias_specialization_pair(
-        &self,
-        db: &'db dyn Db,
-        source: TypeAliasType<'db>,
-        target: TypeAliasType<'db>,
-    ) -> ConstraintSet<'db, 'c> {
-        let Some(source_specialization) = Self::type_alias_specialization_or_default(db, source)
-        else {
-            return self.always();
-        };
-        let Some(target_specialization) = Self::type_alias_specialization_or_default(db, target)
-        else {
-            return self.always();
-        };
-
-        let source_generic_context = source_specialization.generic_context(db);
-        let target_generic_context = target_specialization.generic_context(db);
-        let source_types = source_specialization.types(db);
-        let target_types = target_specialization.types(db);
-
-        if source_generic_context.len(db) != source_types.len()
-            || target_generic_context.len(db) != target_types.len()
-            || source_types.len() != target_types.len()
-        {
-            return self.never();
-        }
-
-        // Type arguments can themselves be recursive aliases:
-        //
-        // ```py
-        // type A[T] = T | tuple[A[T], ...]
-        // type B[T] = T | tuple[B[T], ...]
-        // ```
-        //
-        // While checking `A[A[int]] <: B[B[object]]`, the outer alias pair remains active in
-        // `relation_visitor` until `with_recursion_guard` finishes the original visit. When RHS
-        // expansion reaches the same alias pair again, cycle recovery compares the current
-        // specialization arguments instead of expanding the alias bodies again:
-        //
-        // ```text
-        // fallback(A[A[int]], B[B[object]])
-        //   -> check_type_pair(A[int], B[object])
-        //   -> fallback(A[int], B[object])
-        //   -> check_type_pair(int, object)
-        // ```
-        //
-        // The `check_type_pair(A[int], B[object])` call above re-enters the normal relation
-        // checker, but it does not start from an empty recursion stack. The original alias pair
-        // is still active, so the nested alias relation immediately recovers here instead of
-        // recursively expanding `A` and `B`. This terminates because each fallback step compares
-        // the next layer of finite specialization arguments.
-        if source_generic_context == target_generic_context {
-            return source_generic_context
-                .variables(db)
-                .zip(source_types)
-                .zip(target_types)
-                .when_all(
-                    db,
-                    self.constraints,
-                    |((bound_typevar, source_type), target_type)| {
-                        self.check_recursive_type_alias_type_argument_pair(
-                            db,
-                            RecursiveAliasArgument {
-                                variance: source.variance_of(db, bound_typevar),
-                                materialization_kind: source_specialization
-                                    .materialization_kind(db),
-                                ty: *source_type,
-                            },
-                            RecursiveAliasArgument {
-                                variance: target.variance_of(db, bound_typevar),
-                                materialization_kind: target_specialization
-                                    .materialization_kind(db),
-                                ty: *target_type,
-                            },
-                        )
-                    },
-                );
-        }
-
-        source_generic_context
-            .variables(db)
-            .zip(target_generic_context.variables(db))
-            .zip(source_types)
-            .zip(target_types)
-            .when_all(
-                db,
-                self.constraints,
-                |(((source_typevar, target_typevar), source_type), target_type)| {
-                    self.check_recursive_type_alias_type_argument_pair(
-                        db,
-                        RecursiveAliasArgument {
-                            variance: source.variance_of(db, source_typevar),
-                            materialization_kind: source_specialization.materialization_kind(db),
-                            ty: *source_type,
-                        },
-                        RecursiveAliasArgument {
-                            variance: target.variance_of(db, target_typevar),
-                            materialization_kind: target_specialization.materialization_kind(db),
-                            ty: *target_type,
-                        },
-                    )
-                },
-            )
-    }
-
-    fn check_recursive_type_alias_type_argument_pair(
-        &self,
-        db: &'db dyn Db,
-        source: RecursiveAliasArgument<'db>,
-        target: RecursiveAliasArgument<'db>,
-    ) -> ConstraintSet<'db, 'c> {
-        match (source.variance, target.variance) {
-            (TypeVarVariance::Covariant, TypeVarVariance::Covariant) => {
-                self.check_type_pair(db, source.ty, target.ty)
-            }
-            (TypeVarVariance::Contravariant, TypeVarVariance::Contravariant) => {
-                self.check_type_pair(db, target.ty, source.ty)
-            }
-            _ => self.check_relation_in_invariant_position(
-                db,
-                source.ty,
-                source.materialization_kind,
-                target.ty,
-                target.materialization_kind,
-            ),
-        }
     }
 
     /// Is `target` a metaclass instance (a nominal instance of a subclass of `builtins.type`)?
@@ -1825,7 +1653,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             // that depend on multiple elements, such as all members of an enum, are visible.
             (_, Type::Union(union)) if union.has_aliases(db) => {
                 self.with_recursion_guard(db, source, target, || {
-                    self.check_type_pair(db, source, union.expand_aliases(db))
+                    self.check_type_pair(db, source, union.expand_aliases_for_recursion_guard(db))
                 })
             }
 

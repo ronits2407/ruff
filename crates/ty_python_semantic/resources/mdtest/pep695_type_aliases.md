@@ -646,7 +646,7 @@ def stable_wrapped(x: StableWrapped[int], y: StableWrapped[str]):
 Type relation for recursive aliases is checked structurally.
 
 ```py
-from typing import Callable, Never
+from typing import Callable
 from ty_extensions import static_assert, is_assignable_to, is_subtype_of
 
 type DirectCovariantA[T] = T | tuple[DirectCovariantA[T], ...]
@@ -717,6 +717,14 @@ static_assert(not is_subtype_of(CovariantB2[int], CovariantA2[str]))
 static_assert(is_subtype_of(CovariantA2[int], CovariantB2[object]))
 static_assert(is_subtype_of(CovariantA2[CovariantA2[int]], CovariantB2[CovariantB2[object]]))
 static_assert(not is_subtype_of(CovariantA2[CovariantA2[object]], CovariantB2[CovariantB2[int]]))
+static_assert(is_subtype_of(CovariantA2[int], CovariantA2[object] | CovariantB2[object]))
+
+type AliasOfCovariantA2[T] = CovariantA2[T]
+type AliasOfCovariantB2[T] = CovariantB2[T]
+
+static_assert(is_subtype_of(AliasOfCovariantA2[int], AliasOfCovariantB2[object]))
+static_assert(is_subtype_of(AliasOfCovariantA2[AliasOfCovariantA2[int]], AliasOfCovariantB2[AliasOfCovariantB2[object]]))
+static_assert(not is_subtype_of(AliasOfCovariantA2[object], AliasOfCovariantB2[int]))
 
 type ContravariantA[T] = Callable[[T], ContravariantB[T] | None]
 type ContravariantB[T] = Callable[[T], ContravariantA[T] | None]
@@ -756,6 +764,9 @@ type DuplicateGrowB[T, U] = T | tuple[DuplicateGrowB[T | DuplicateGrowB[T, U], U
 
 static_assert(is_subtype_of(DuplicateGrowA[int, int], DuplicateGrowB[int, int]))
 
+# TODO: These decidable growing relations should be classified by a more precise recursive-alias
+# solver instead of relying on the conservative recursion guard.
+
 type DifferentGrowA[T] = T | tuple[DifferentGrowA[list[T]]]
 type DifferentGrowB[T] = T | tuple[DifferentGrowB[set[T]]]
 
@@ -775,6 +786,31 @@ type BadA[T] = T | tuple[BadA[BadA[str]]]
 type BadB[T] = T | tuple[BadB[BadA[int]]]
 
 static_assert(not is_subtype_of(BadA[int], BadB[int]))
+```
+
+### Recursive generic alias relations that encode CFG inclusion
+
+Recursive generic aliases can encode context-free grammars by threading a continuation type through
+the alias type arguments. For arbitrary aliases of this shape, deciding
+`GrammarA[End] <: GrammarB[End]` would decide context-free language inclusion, which is undecidable.
+This section documents the encoding shape rather than a future TODO for ty to prove every relation
+in the fragment.
+
+```py
+from typing import Literal
+from ty_extensions import static_assert, is_subtype_of
+
+type End = None
+type A[Rest] = tuple[Literal["a"], Rest]
+type B[Rest] = tuple[Literal["b"], Rest]
+
+# `AnyWord[Rest]` recognizes any word over `a | b`, followed by `Rest`.
+type AnyWord[Rest] = Rest | A[AnyWord[Rest]] | B[AnyWord[Rest]]
+
+# `Balanced[Rest]` recognizes `a^n b^n`, followed by `Rest`.
+type Balanced[Rest] = Rest | A[Balanced[B[Rest]]]
+
+static_assert(not is_subtype_of(B[End], Balanced[End]))
 ```
 
 ### Subtyping of materializations of cyclic aliases
