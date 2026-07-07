@@ -647,7 +647,8 @@ Type relation for recursive aliases is checked structurally.
 
 ```py
 from typing import Callable
-from ty_extensions import static_assert, is_assignable_to, is_subtype_of
+from ty_extensions import static_assert
+from ty_extensions._internal import is_assignable_to, is_subtype_of
 
 type DirectCovariantA[T] = T | tuple[DirectCovariantA[T], ...]
 type DirectCovariantB[T] = T | tuple[DirectCovariantB[T], ...]
@@ -698,7 +699,8 @@ but their type arguments still have to satisfy the alias variance.
 
 ```py
 from typing import Callable, Never
-from ty_extensions import static_assert, is_assignable_to, is_subtype_of
+from ty_extensions import static_assert
+from ty_extensions._internal import is_assignable_to, is_subtype_of
 
 type CovariantA[T] = T | tuple[CovariantB[T], ...]
 type CovariantB[T] = T | tuple[CovariantA[T], ...]
@@ -809,7 +811,8 @@ in the fragment.
 
 ```py
 from typing import Literal
-from ty_extensions import static_assert, is_subtype_of
+from ty_extensions import static_assert
+from ty_extensions._internal import is_subtype_of
 
 type End = None
 type A[Rest] = tuple[Literal["a"], Rest]
