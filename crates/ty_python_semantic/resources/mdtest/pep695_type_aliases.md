@@ -764,6 +764,17 @@ type DuplicateGrowB[T, U] = T | tuple[DuplicateGrowB[T | DuplicateGrowB[T, U], U
 
 static_assert(is_subtype_of(DuplicateGrowA[int, int], DuplicateGrowB[int, int]))
 
+type ArityGrowA[T] = T | tuple[ArityGrowB[T | ArityGrowA[T], T]]
+type ArityGrowB[T, U] = T | U | tuple[ArityGrowA[T]]
+
+static_assert(is_subtype_of(ArityGrowA[int], ArityGrowB[int, int]))
+static_assert(not is_subtype_of(ArityGrowA[int], ArityGrowB[int, str]))
+
+type SourceConstraintA[T] = T | list[T] | tuple[SourceConstraintA[str]]
+type SourceConstraintB[T] = T | list[int] | tuple[SourceConstraintB[str]]
+
+static_assert(not is_subtype_of(SourceConstraintA[int], SourceConstraintB[int]))
+
 # TODO: These decidable growing relations should be classified by a more precise recursive-alias
 # solver instead of relying on the conservative recursion guard.
 

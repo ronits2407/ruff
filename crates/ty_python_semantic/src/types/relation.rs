@@ -781,24 +781,24 @@ pub(super) struct TypeRelationChecker<'a, 'c, 'db> {
 }
 
 #[derive(Clone, Debug, Eq)]
-enum RecursiveAliasSchemaType<'db> {
-    SourceAlias(Box<[Self]>),
-    TargetAlias(Box<[Self]>),
+enum ParametricTerm<'db> {
+    SourceConstructor(Box<[Self]>),
+    TargetConstructor(Box<[Self]>),
     Concrete(Type<'db>),
     Union(Box<[Self]>),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum RecursiveAliasSchemaKind {
+enum ParametricConstructorSide {
     Source,
     Target,
 }
 
-impl PartialEq for RecursiveAliasSchemaType<'_> {
+impl PartialEq for ParametricTerm<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::SourceAlias(left), Self::SourceAlias(right))
-            | (Self::TargetAlias(left), Self::TargetAlias(right)) => left == right,
+            (Self::SourceConstructor(left), Self::SourceConstructor(right))
+            | (Self::TargetConstructor(left), Self::TargetConstructor(right)) => left == right,
             (Self::Concrete(left), Self::Concrete(right)) => left == right,
             (Self::Union(left), Self::Union(right)) => {
                 left.len() == right.len()
@@ -813,7 +813,7 @@ impl PartialEq for RecursiveAliasSchemaType<'_> {
     }
 }
 
-impl<'db> RecursiveAliasSchemaType<'db> {
+impl<'db> ParametricTerm<'db> {
     fn from_type(
         db: &'db dyn Db,
         ty: Type<'db>,
@@ -822,7 +822,7 @@ impl<'db> RecursiveAliasSchemaType<'db> {
     ) -> Self {
         match ty {
             Type::TypeAlias(alias) if alias.definition(db) == active_source.definition(db) => {
-                Self::SourceAlias(Self::alias_arguments(
+                Self::SourceConstructor(Self::alias_arguments(
                     db,
                     alias,
                     active_source,
@@ -830,7 +830,7 @@ impl<'db> RecursiveAliasSchemaType<'db> {
                 ))
             }
             Type::TypeAlias(alias) if alias.definition(db) == active_target.definition(db) => {
-                Self::TargetAlias(Self::alias_arguments(
+                Self::TargetConstructor(Self::alias_arguments(
                     db,
                     alias,
                     active_source,
@@ -898,12 +898,12 @@ impl<'db> RecursiveAliasSchemaType<'db> {
     }
 }
 
-struct RecursiveAliasPairSchema<'db> {
-    source: Box<[RecursiveAliasSchemaType<'db>]>,
-    target: Box<[RecursiveAliasSchemaType<'db>]>,
+struct ParametricSubtypingRule<'db> {
+    source: Box<[ParametricTerm<'db>]>,
+    target: Box<[ParametricTerm<'db>]>,
 }
 
-impl<'db> RecursiveAliasPairSchema<'db> {
+impl<'db> ParametricSubtypingRule<'db> {
     fn from_specializations(
         db: &'db dyn Db,
         source: Specialization<'db>,
@@ -922,94 +922,87 @@ impl<'db> RecursiveAliasPairSchema<'db> {
         specialization: Specialization<'db>,
         active_source: TypeAliasType<'db>,
         active_target: TypeAliasType<'db>,
-    ) -> Box<[RecursiveAliasSchemaType<'db>]> {
+    ) -> Box<[ParametricTerm<'db>]> {
         specialization
             .types(db)
             .iter()
-            .map(|ty| RecursiveAliasSchemaType::from_type(db, *ty, active_source, active_target))
+            .map(|ty| ParametricTerm::from_type(db, *ty, active_source, active_target))
             .collect()
     }
 
-    fn has_same_lengths_as(&self, current: &Self) -> bool {
-        self.source.len() == self.target.len()
-            && self.source.len() == current.source.len()
-            && self.target.len() == current.target.len()
+    fn has_same_constructor_arities_as(&self, current: &Self) -> bool {
+        self.source.len() == current.source.len() && self.target.len() == current.target.len()
     }
 }
 
 #[derive(Clone, Copy)]
-struct RecursiveAliasSchemaMatcher<'schema, 'db> {
-    active: &'schema RecursiveAliasPairSchema<'db>,
+struct ParametricRuleApplication<'rule, 'db> {
+    rule: &'rule ParametricSubtypingRule<'db>,
 }
 
-impl<'schema, 'db> RecursiveAliasSchemaMatcher<'schema, 'db> {
-    const fn new(active: &'schema RecursiveAliasPairSchema<'db>) -> Self {
-        Self { active }
+impl<'rule, 'db> ParametricRuleApplication<'rule, 'db> {
+    const fn new(rule: &'rule ParametricSubtypingRule<'db>) -> Self {
+        Self { rule }
     }
 
-    fn matches(self, current: &RecursiveAliasPairSchema<'db>) -> bool {
-        self.active.has_same_lengths_as(current)
-            && (self.current_grows_from_active(current)
-                || self.current_matches_active_permutation(current))
+    fn accepts(self, current: &ParametricSubtypingRule<'db>) -> bool {
+        self.rule.has_same_constructor_arities_as(current)
+            && (self.current_is_parametric_instance(current)
+                || self.current_satisfies_atomic_constraints(current))
     }
 
-    fn current_grows_from_active(self, current: &RecursiveAliasPairSchema<'db>) -> bool {
-        self.arguments_grow_from_schema(&current.source, &self.active.source)
-            && self.arguments_grow_from_schema(&current.target, &self.active.target)
+    fn current_is_parametric_instance(self, current: &ParametricSubtypingRule<'db>) -> bool {
+        self.arguments_are_parametric_instances(&current.source, &self.rule.source)
+            && self.arguments_are_parametric_instances(&current.target, &self.rule.target)
     }
 
-    fn current_matches_active_permutation(self, current: &RecursiveAliasPairSchema<'db>) -> bool {
-        self.active.target.iter().zip(&current.target).all(
-            |(active_target_type, current_target_type)| {
-                let Some(source_index) = self.active_source_index_for(active_target_type) else {
-                    return false;
-                };
-                current
-                    .source
-                    .get(source_index)
-                    .is_some_and(|current_source_type| {
-                        self.corresponds_to(current_source_type, current_target_type)
-                    })
-            },
-        )
+    fn current_satisfies_atomic_constraints(self, current: &ParametricSubtypingRule<'db>) -> bool {
+        self.arguments_are_parametric_instances(&current.source, &self.rule.source)
+            && self
+                .rule
+                .target
+                .iter()
+                .zip(&current.target)
+                .all(|(rule_target, current_target)| {
+                    let Some(source_index) = self.source_parameter_for_target(rule_target) else {
+                        return false;
+                    };
+                    current
+                        .source
+                        .get(source_index)
+                        .is_some_and(|current_source| {
+                            self.satisfies_same_constraint(current_source, current_target)
+                        })
+                })
     }
 
-    fn active_source_index_for(
-        self,
-        active_target_type: &RecursiveAliasSchemaType<'db>,
-    ) -> Option<usize> {
-        self.active
+    fn source_parameter_for_target(self, rule_target: &ParametricTerm<'db>) -> Option<usize> {
+        self.rule
             .source
             .iter()
-            .positions(|active_source_type| {
-                self.corresponds_to(active_source_type, active_target_type)
-            })
+            .positions(|rule_source| self.satisfies_same_constraint(rule_source, rule_target))
             .exactly_one()
             .ok()
     }
 
-    fn equivalent_to(
-        self,
-        left: &RecursiveAliasSchemaType<'db>,
-        right: &RecursiveAliasSchemaType<'db>,
-    ) -> bool {
-        use RecursiveAliasSchemaType::{Concrete, SourceAlias, TargetAlias, Union};
+    fn equivalent(self, left: &ParametricTerm<'db>, right: &ParametricTerm<'db>) -> bool {
+        use ParametricTerm::{Concrete, SourceConstructor, TargetConstructor, Union};
 
         match (left, right) {
-            (SourceAlias(left), SourceAlias(right)) => {
-                self.slices_are_equivalent(left, right)
-                    || self.arguments_match_same_schema(
+            (SourceConstructor(left), SourceConstructor(right)) => {
+                self.arguments_are_equivalent(left, right)
+                    || self.arguments_match_same_rule_constructor(
                         left,
                         right,
-                        RecursiveAliasSchemaKind::Source,
+                        ParametricConstructorSide::Source,
                     )
             }
-            (TargetAlias(left), TargetAlias(right)) => {
-                self.slices_are_equivalent(left, right)
-                    || self.arguments_match_same_schema(
+            (TargetConstructor(left), TargetConstructor(right)) => {
+                self.arguments_are_equivalent(left, right)
+                    || self.arguments_match_same_rule_constructor(
                         left,
                         right,
-                        RecursiveAliasSchemaKind::Target,
+                        ParametricConstructorSide::Target,
                     )
             }
             (Concrete(left), Concrete(right)) => left == right,
@@ -1018,131 +1011,133 @@ impl<'schema, 'db> RecursiveAliasSchemaMatcher<'schema, 'db> {
                     && left.iter().all(|left_element| {
                         right
                             .iter()
-                            .any(|right_element| self.equivalent_to(left_element, right_element))
+                            .any(|right_element| self.equivalent(left_element, right_element))
                     })
             }
             _ => false,
         }
     }
 
-    fn corresponds_to(
+    fn satisfies_same_constraint(
         self,
-        left: &RecursiveAliasSchemaType<'db>,
-        right: &RecursiveAliasSchemaType<'db>,
+        left: &ParametricTerm<'db>,
+        right: &ParametricTerm<'db>,
     ) -> bool {
-        self.equivalent_to(left, right)
-            || self.grows_from(left, right)
-            || self.grows_from(right, left)
+        self.equivalent(left, right)
+            || self.is_parametric_instance_of(left, right)
+            || self.is_parametric_instance_of(right, left)
     }
 
-    fn slices_are_equivalent(
+    fn arguments_are_equivalent(
         self,
-        left: &[RecursiveAliasSchemaType<'db>],
-        right: &[RecursiveAliasSchemaType<'db>],
+        left: &[ParametricTerm<'db>],
+        right: &[ParametricTerm<'db>],
     ) -> bool {
         left.len() == right.len()
             && left
                 .iter()
                 .zip(right)
-                .all(|(left, right)| self.equivalent_to(left, right))
+                .all(|(left, right)| self.equivalent(left, right))
     }
 
-    fn arguments_match_same_schema(
+    fn arguments_match_same_rule_constructor(
         self,
-        left: &[RecursiveAliasSchemaType<'db>],
-        right: &[RecursiveAliasSchemaType<'db>],
-        kind: RecursiveAliasSchemaKind,
+        left: &[ParametricTerm<'db>],
+        right: &[ParametricTerm<'db>],
+        side: ParametricConstructorSide,
     ) -> bool {
-        self.any_argument_schema(kind, |schema_arguments| {
-            self.arguments_grow_from_schema(left, schema_arguments)
-                && self.arguments_grow_from_schema(right, schema_arguments)
+        self.any_rule_constructor_arguments(side, |rule_arguments| {
+            self.arguments_are_parametric_instances(left, rule_arguments)
+                && self.arguments_are_parametric_instances(right, rule_arguments)
         })
     }
 
-    fn arguments_match_any_schema(
+    fn arguments_match_rule_constructor(
         self,
-        arguments: &[RecursiveAliasSchemaType<'db>],
-        kind: RecursiveAliasSchemaKind,
+        arguments: &[ParametricTerm<'db>],
+        side: ParametricConstructorSide,
     ) -> bool {
-        self.any_argument_schema(kind, |schema_arguments| {
-            self.arguments_grow_from_schema(arguments, schema_arguments)
+        self.any_rule_constructor_arguments(side, |rule_arguments| {
+            self.arguments_are_parametric_instances(arguments, rule_arguments)
         })
     }
 
-    fn any_argument_schema(
+    fn any_rule_constructor_arguments(
         self,
-        kind: RecursiveAliasSchemaKind,
-        predicate: impl Fn(&[RecursiveAliasSchemaType<'db>]) -> bool,
+        side: ParametricConstructorSide,
+        predicate: impl Fn(&[ParametricTerm<'db>]) -> bool,
     ) -> bool {
-        let active_arguments = match kind {
-            RecursiveAliasSchemaKind::Source => &self.active.source,
-            RecursiveAliasSchemaKind::Target => &self.active.target,
+        let rule_arguments = match side {
+            ParametricConstructorSide::Source => &self.rule.source,
+            ParametricConstructorSide::Target => &self.rule.target,
         };
 
-        predicate(active_arguments)
+        predicate(rule_arguments)
     }
 
-    fn arguments_grow_from_schema(
+    fn arguments_are_parametric_instances(
         self,
-        arguments: &[RecursiveAliasSchemaType<'db>],
-        schema_arguments: &[RecursiveAliasSchemaType<'db>],
+        arguments: &[ParametricTerm<'db>],
+        rule_arguments: &[ParametricTerm<'db>],
     ) -> bool {
-        arguments.len() == schema_arguments.len()
+        arguments.len() == rule_arguments.len()
             && arguments
                 .iter()
-                .zip(schema_arguments)
-                .all(|(argument, schema_argument)| self.grows_from(argument, schema_argument))
+                .zip(rule_arguments)
+                .all(|(argument, rule_argument)| {
+                    self.is_parametric_instance_of(argument, rule_argument)
+                })
     }
 
-    fn grows_from(
+    fn is_parametric_instance_of(
         self,
-        argument: &RecursiveAliasSchemaType<'db>,
-        schema_argument: &RecursiveAliasSchemaType<'db>,
+        argument: &ParametricTerm<'db>,
+        rule_argument: &ParametricTerm<'db>,
     ) -> bool {
-        if self.equivalent_to(argument, schema_argument) {
+        if self.equivalent(argument, rule_argument) {
             return true;
         }
 
-        let RecursiveAliasSchemaType::Union(elements) = argument else {
+        let ParametricTerm::Union(elements) = argument else {
             return false;
         };
 
-        match schema_argument {
-            RecursiveAliasSchemaType::Union(schema_elements) => {
-                self.union_elements_grow_from(elements, schema_elements)
+        match rule_argument {
+            ParametricTerm::Union(rule_elements) => {
+                self.union_is_parametric_instance(elements, rule_elements)
             }
-            schema_argument => {
-                self.union_elements_grow_from(elements, std::slice::from_ref(schema_argument))
+            rule_argument => {
+                self.union_is_parametric_instance(elements, std::slice::from_ref(rule_argument))
             }
         }
     }
 
-    fn union_elements_grow_from(
+    fn union_is_parametric_instance(
         self,
-        elements: &[RecursiveAliasSchemaType<'db>],
-        schema_elements: &[RecursiveAliasSchemaType<'db>],
+        elements: &[ParametricTerm<'db>],
+        rule_elements: &[ParametricTerm<'db>],
     ) -> bool {
-        schema_elements.iter().all(|schema_element| {
+        rule_elements.iter().all(|rule_element| {
             elements
                 .iter()
-                .any(|element| self.equivalent_to(element, schema_element))
+                .any(|element| self.equivalent(element, rule_element))
         }) && elements.iter().all(|element| {
-            schema_elements
+            rule_elements
                 .iter()
-                .any(|schema_element| self.equivalent_to(element, schema_element))
-                || self.is_recursive_alias_schema_instance(element)
+                .any(|rule_element| self.equivalent(element, rule_element))
+                || self.is_recursive_constructor_application(element)
         })
     }
 
-    fn is_recursive_alias_schema_instance(self, argument: &RecursiveAliasSchemaType<'db>) -> bool {
+    fn is_recursive_constructor_application(self, argument: &ParametricTerm<'db>) -> bool {
         match argument {
-            RecursiveAliasSchemaType::SourceAlias(arguments) => {
-                self.arguments_match_any_schema(arguments, RecursiveAliasSchemaKind::Source)
+            ParametricTerm::SourceConstructor(arguments) => {
+                self.arguments_match_rule_constructor(arguments, ParametricConstructorSide::Source)
             }
-            RecursiveAliasSchemaType::TargetAlias(arguments) => {
-                self.arguments_match_any_schema(arguments, RecursiveAliasSchemaKind::Target)
+            ParametricTerm::TargetConstructor(arguments) => {
+                self.arguments_match_rule_constructor(arguments, ParametricConstructorSide::Target)
             }
-            RecursiveAliasSchemaType::Concrete(_) | RecursiveAliasSchemaType::Union(_) => false,
+            ParametricTerm::Concrete(_) | ParametricTerm::Union(_) => false,
         }
     }
 }
@@ -1352,7 +1347,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             Type::TypeAlias(target_alias),
         ) = (active_source, active_target, source, target)
         {
-            if Self::recursive_type_alias_pair_matches_active_schema(
+            if Self::recursive_type_alias_pair_has_parametric_rule(
                 db,
                 active_source_alias,
                 active_target_alias,
@@ -1367,7 +1362,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
         self.always()
     }
 
-    fn recursive_type_alias_pair_matches_active_schema(
+    fn recursive_type_alias_pair_has_parametric_rule(
         db: &'db dyn Db,
         active_source: TypeAliasType<'db>,
         active_target: TypeAliasType<'db>,
@@ -1403,14 +1398,14 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             return false;
         }
 
-        let active_schema = RecursiveAliasPairSchema::from_specializations(
+        let rule = ParametricSubtypingRule::from_specializations(
             db,
             active_source_specialization,
             active_target_specialization,
             active_source,
             active_target,
         );
-        let current_schema = RecursiveAliasPairSchema::from_specializations(
+        let current_application = ParametricSubtypingRule::from_specializations(
             db,
             current_source_specialization,
             current_target_specialization,
@@ -1418,12 +1413,12 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             active_target,
         );
 
-        // Growing aliases can revisit the same alias pair with larger arguments such as
-        // `U | A[T, U]`. The guarded recursive obligation closes only if the current arguments are
-        // an instance of the active finite schema. Everything else is outside this finite fragment,
-        // so the caller conservatively rejects it instead of generating another recursive
+        // Growing aliases can revisit the same constructor pair with larger arguments such as
+        // `U | A[T, U]`. Close the cycle only when the current constructor application is an
+        // instance of the finite parametric rule induced by the active obligation. Everything else
+        // is outside this finite fragment and is rejected instead of generating another recursive
         // obligation.
-        RecursiveAliasSchemaMatcher::new(&active_schema).matches(&current_schema)
+        ParametricRuleApplication::new(&rule).accepts(&current_application)
     }
 
     fn type_alias_specialization_or_default(
